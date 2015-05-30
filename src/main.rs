@@ -9,7 +9,6 @@ extern crate env_logger;
 use std::path::PathBuf;
 use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::borrow::Borrow;
 
 use std::fs;
 use std::io;
@@ -21,8 +20,7 @@ struct Stage {
 
 #[derive(Debug)]
 struct Checkout {
-    path: PathBuf,
-    ignore: HashSet<PathBuf>
+    path: PathBuf
 }
 
 #[derive(Debug)]
@@ -148,15 +146,14 @@ impl Stage {
 
 impl Default for Checkout {
     fn default() -> Checkout {
-        Checkout::new::<_, PathBuf, _>(".", vec![])
+        Checkout::new(".")
     }
 }
 
 impl Checkout {
-    pub fn new<T: Into<PathBuf>, U: Into<PathBuf>, V: IntoIterator<Item=U>>(path: T, ignore: V) -> Checkout {
+    pub fn new<T: Into<PathBuf>>(path: T) -> Checkout {
         Checkout {
-            path: path.into(),
-            ignore: HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}))
+            path: path.into()
         }
     }
 
@@ -178,20 +175,9 @@ impl Checkout {
         }
     }
 
-    pub fn ignore<T: Into<PathBuf>>(&mut self, path: T) -> bool {
-        self.ignore.insert(path.into())
-    }
-
-    pub fn track<T: Borrow<PathBuf>>(&mut self, path: T) -> bool {
-        self.ignore.remove(path.borrow())
-    }
-
-    pub fn is_ignored<T: Borrow<PathBuf>>(&self, path: T) -> bool {
-        self.ignore.contains(path.borrow())
-    }
-
-    pub fn stage_dir_all<T: Into<PathBuf>>(&self, stage: &mut Stage, path: T) -> Result<(), io::Error> {
+    pub fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(&self, stage: &mut Stage, path: T, ignore: V) -> Result<(), io::Error> where V::Item: Into<PathBuf> {
         let mut to_visit = vec![self.path.join(path.into())];
+        let to_ignore: HashSet<PathBuf> = HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}));
 
         info!("Copying directory tree");
         while !to_visit.is_empty() {
@@ -228,7 +214,7 @@ impl Checkout {
                 };
 
                 trace!("Entry path: {:?}", entry.path());
-                if self.is_ignored(&id) {
+                if to_ignore.contains(&id) {
                     // ignore our own directory
                     trace!("Path was in ignore set");
                     continue;
@@ -249,7 +235,7 @@ impl Checkout {
                     }
                 }
                 
-                // create the PathInfo object
+                trace!("Creating path info object");
                 let info = PathInfo::new(entry.path(), id);
 
                 debug!("Adding path to stage");
@@ -294,8 +280,6 @@ fn main() {
 
     trace!("Creating checkout object");
     let mut checkout = Checkout::default();
-    trace!("Ignoring repo directory");
-    checkout.ignore(".h2");
     debug!("Initializing checkout");
     match checkout.init() {
         Ok(()) => {
@@ -319,7 +303,7 @@ fn main() {
     }
     
     info!("Walking current directory");
-    match checkout.stage_dir_all(&mut stage, PathBuf::from(".")) {
+    match checkout.stage_dir_all(&mut stage, PathBuf::from("."), vec![".h2"]) {
         Ok(()) => {
             debug!("Walk successful");
         },
