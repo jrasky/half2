@@ -23,7 +23,6 @@ use std::io;
 use std::fmt;
 use std::mem;
 use std::slice;
-use std::ops;
 
 trait BufItem: Ord + fmt::Debug {
     fn as_buf(&self) -> &[u8];
@@ -69,7 +68,7 @@ struct BufNodeHead {
 struct BufNode<T: BufItem> {
     head: BufNodeHead,
     items: Vec<T>,
-    next: Option<Vec<u64>>
+    next: Vec<u64>
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,15 +182,15 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         }
         // write that
         try!(self.buffer.write_all(items_buf.as_ref()));
-        match node.next {
-            None => Ok(()),
-            Some(ref next) => {
-                // create the right kind of slice
-                let next_buf = unsafe {slice::from_raw_parts(next.as_ptr() as *const _,
-                                                             next.len() * std::u64::BYTES)};
-                // write that, use as return value
-                self.buffer.write_all(next_buf)
-            }
+        
+        if node.next.len() > 0 {
+            // create the right kind of slice
+            let next_buf = unsafe {slice::from_raw_parts(node.next.as_ptr() as *const _,
+                                                         node.next.len() * std::u64::BYTES)};
+            // write that, use as return value
+            self.buffer.write_all(next_buf)
+        } else {
+            Ok(())
         }
     }
 
@@ -223,11 +222,13 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             items.push(V::from_buf(slice::from_raw_parts(item_ptr, V::buf_len())));
             item_ptr = item_ptr.offset(V::buf_len() as isize);
         }
-        let mut next = None;
+        let mut next;
         if !head.leaf {
             let mut next_buf = vec![0; (head.len + 1) * std::u64::BYTES];
             try!(self.buffer.read(next_buf.as_mut()));
-            next = Some(Vec::from_raw_buf(next_buf.as_ptr() as *const u64, head.len + 1));
+            next = Vec::from_raw_buf(next_buf.as_ptr() as *const u64, head.len + 1);
+        } else {
+            next = vec![];
         }
         Ok(BufNode {
             head: *head,
@@ -282,7 +283,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                         leaf: false
                     },
                     items: vec![item],
-                    next: None
+                    next: vec![]
                 };
                 try!(self.write_node(&node));
                 // set the root node
@@ -296,144 +297,46 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
         // read the root node
         let mut current = try!(unsafe {self.read_node(root_idx)});
-        let mut path = vec![];
-        while !current.head.leaf {
-            if &item > current.items.last().unwrap() {
-                let next = *current.next.as_ref().unwrap().last().unwrap();
-                path.push(current);
-                current = try!(unsafe {self.read_node(next)});
-            } else {
-                for i in 0..current.head.len {
-                    if &item == current.items.get(i).unwrap() {
-                        // item already in tree
-                        return Ok(true);
-                    } else if &item < current.items.get(i).unwrap() {
-                        let next = current.next.as_ref().unwrap()[i];
-                        path.push(current);
-                        current = try!(unsafe {self.read_node(next)});
-                        break;
-                    }
-                }
-            }
-        }
+        let mut sep;
 
-        // insert the element into the node
-        // default to the last element
-        let mut index = current.items.len();
-        for i in 0..current.head.len {
-            if &item == current.items.get(i).unwrap() {
-                // item already in tree
-                return Ok(true);
-            } else if &item < current.items.get(i).unwrap() {
-                index = i;
-                break;
-            }
-        }
-        current.items.insert(index, item);
-        // increment the len
-        current.head.len += 1;
-
-        // we should now have a current leaf, and a path of nodes leading to it
-        if current.head.len <= self.head.size {
-            // no need to propagate anything, just save
-            try!(self.write_node(&current));
-            Ok(false)
-        } else {
-            // hard case: split the node
-            // split at the median value
-            index = current.items.len() / 2 + 1;
-
-            // create the new right node
-            let mut right_node = BufNode {
+        // check if the root node is full
+        if current.head.len == self.head.size {
+            // split the node
+            // pick a median value
+            let index = current.head.len / 2 + 1;
+            // create a new right node
+            let right_node = BufNode {
                 head: BufNodeHead {
                     idx: try!(self.new_idx()),
-                    len: current.head.len - index,
-                    leaf: true
+                    len: current.head.len - index - 1,
+                    leaf: current.head.leaf
                 },
                 items: current.items.split_off(index + 1),
-                next: None
-            };
-
-            // pop off our separator value
-            let mut sep = current.items.pop().unwrap();
-            let mut idx = current.head.idx;
-            // reset the len
-            current.head.len = current.items.len();
-            // write both nodes
-            try!(self.write_node(&right_node));
-            // at this point current is already the correct left node
-            try!(self.write_node(&current));
-
-            // now the even harder part, which is propagating everything up the tree.
-            loop {
-                // grab the next element up the tree
-                current = match path.pop() {
-                    None => break, // out of path, create new root element
-                    Some(item) => item
-                };
-
-                // search for our index in the next list
-                let mut child_idx = current.head.len + 2;
-                for i in 0..current.head.len + 1 {
-                    if current.next.as_ref().unwrap()[i] == idx {
-                        child_idx = i;
-                        break;
+                next: {
+                    if current.head.leaf {
+                        vec![]
+                    } else {
+                        current.next.split_off(index + 1)
                     }
                 }
+            };
 
-                // panic if we didn't find it
-                if child_idx == current.head.len + 2 {
-                    panic!("Didn't find idx in parent");
-                }
-
-                // insert the info
-                current.items.insert(child_idx, sep);
-                current.head.len += 1;
-                current.next.as_mut().unwrap().insert(child_idx + 1, right_node.head.idx);
-
-                // now have all info, insert separator into node
-                if current.head.len < self.head.size {
-                    // easy case
-                    // write the node
-                    try!(self.write_node(&current));
-                    // done!
-                    return Ok(false);
+            // update our separator value
+            sep = current.items.pop().unwrap();
+            // check end conditions now to satisfy borrow checker
+            let routing = {
+                if item == sep {
+                    0
+                } else if item > sep {
+                    1
                 } else {
-                    // cry a lot
-                    // split the list at the median
-                    index = current.items.len() / 2 + 1;
-
-                    // create the new right node
-                    right_node = BufNode {
-                        head: BufNodeHead {
-                            idx: try!(self.new_idx()),
-                            len: current.head.len - child_idx,
-                            leaf: false
-                        },
-                        items: current.items.split_off(index + 1),
-                        next: Some({
-                            let mut next = vec![idx];
-                            next.extend(current.next.as_mut().unwrap().split_off(index + 2));
-                            next
-                        })
-                    };
-
-                    // get new sep
-                    sep = current.items.pop().unwrap();
-                    // pop off our next entry
-                    current.next.as_mut().unwrap().pop().unwrap();
-                    // change idx
-                    idx = current.head.idx;
-                    // reset current len
-                    current.head.len = current.items.len();
-                    // write both nodes
-                    try!(self.write_node(&right_node));
-                    try!(self.write_node(&current));
-                    // and loop, propagating the change upwards again.
+                    2
                 }
-            }
+            };
+            // update curren'ts len
+            current.head.len = current.items.len();
 
-            // if we've reached this point, create a new root node with just the separator
+            // create a new root node
             let root_node = BufNode {
                 head: BufNodeHead {
                     idx: try!(self.new_idx()),
@@ -441,18 +344,130 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                     leaf: false
                 },
                 items: vec![sep],
-                next: Some(vec![idx, right_node.head.idx])
+                next: vec![current.head.idx, right_node.head.idx]
             };
 
-            // write that node
+            // write everything
+            try!(self.write_node(&current));
+            try!(self.write_node(&right_node));
             try!(self.write_node(&root_node));
-            // update the tree's root node
+
+            // update the meta info
             self.head.root = Some(root_node.head.idx);
-            // write the meta info
             try!(self.write_meta());
-            // done!
-            Ok(false)
+
+            // update current
+            if routing == 0 {
+                return Ok(true);
+            } else if routing == 1 {
+                current = right_node;
+            } // otherwise current is already correct
         }
+
+        while !current.head.leaf {
+            // figure out which next node we need to get
+            let mut next = *current.next.last().unwrap();
+            if &item < current.items.last().unwrap() {
+                for (index, node_item) in current.items.iter().enumerate() {
+                    if &item < node_item {
+                        next = *current.next.get(index).unwrap();
+                        break;
+                    } else if &item == node_item {
+                        return Ok(true);
+                    }
+                }
+            } else if &item == current.items.last().unwrap() {
+                return Ok(true);
+            }
+
+            // read the node
+            let mut next_node = try!(unsafe {self.read_node(next)});
+
+            // see if we need to split the node
+            if next_node.head.len == self.head.size {
+                // create a new right node
+                // pick a median value
+                let index = next_node.head.len / 2 + 1;
+
+                // create a new right node
+                let right_node = BufNode {
+                    head: BufNodeHead {
+                        idx: try!(self.new_idx()),
+                        len: next_node.head.len - index - 1,
+                        leaf: next_node.head.leaf
+                    },
+                    items: next_node.items.split_off(index + 1),
+                    next: {
+                        if next_node.head.leaf {
+                            vec![]
+                        } else {
+                            next_node.next.split_off(index + 1)
+                        }
+                    }
+                };
+
+                // pop off the separator
+                sep = next_node.items.pop().unwrap();
+                // check end conditions now to satisfy borrow checker
+                let routing = {
+                    if item < sep {
+                        0
+                    } else if item > sep {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                // update the len
+                next_node.head.len = next_node.items.len();
+
+                // insert the separator into the current node
+                let mut index = current.head.len;
+                for (i, item) in current.items.iter().enumerate() {
+                    if &sep < item {
+                        index = i;
+                        break;
+                    }
+                }
+
+                current.next.insert(index + 1, right_node.head.idx);
+                current.items.insert(index, sep);
+                current.head.len += 1;
+
+                // write everything
+                try!(self.write_node(&right_node));
+                try!(self.write_node(&next_node));
+                try!(self.write_node(&current));
+
+                // update current
+                if routing == 0 {
+                    current = next_node;
+                } else if routing == 1 {
+                    current = right_node;
+                } else {
+                    return Ok(true);
+                }
+            } else {
+                // just update the next node
+                current = next_node;
+            }
+        }
+
+        // at this point current is a leaf node with space to insert our item
+        let mut index = current.head.len;
+        for (i, node_item) in current.items.iter().enumerate() {
+            if &item < node_item {
+                index = i;
+                break;
+            }
+        }
+
+        current.items.insert(index, item);
+        current.head.len += 1;
+        try!(self.write_node(&current));
+
+        // done!
+        Ok(false)
     }
 }
 
