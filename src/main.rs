@@ -269,8 +269,8 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         }
     }
 
-    pub fn insert<K: Into<V>>(&mut self, to_item: K) -> io::Result<bool> {
-        let item = to_item.into();
+    pub fn insert<K: Into<V>>(&mut self, to_item: K) -> io::Result<Option<V>> {
+        let mut item = to_item.into();
 
         // check for a root node
         let root_idx = match self.head.root {
@@ -290,7 +290,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 self.head.root = Some(node.head.idx);
                 // save the metadata
                 try!(self.write_meta());
-                return Ok(false);
+                return Ok(None);
             },
             Some(idx) => idx
         };
@@ -323,16 +323,8 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
             // update our separator value
             sep = current.items.pop().unwrap();
-            // check end conditions now to satisfy borrow checker
-            let routing = {
-                if item == sep {
-                    0
-                } else if item > sep {
-                    1
-                } else {
-                    2
-                }
-            };
+            let finished = item == sep;
+            let to_return;
             // update curren'ts len
             current.head.len = current.items.len();
 
@@ -343,7 +335,15 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                     len: 1,
                     leaf: false
                 },
-                items: vec![sep],
+                items: vec![{
+                    if finished {
+                        to_return = sep;
+                        item
+                    } else {
+                        to_return = item;
+                        sep
+                    }
+                }],
                 next: vec![current.head.idx, right_node.head.idx]
             };
 
@@ -357,27 +357,38 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             try!(self.write_meta());
 
             // update current
-            if routing == 0 {
-                return Ok(true);
-            } else if routing == 1 {
+            if finished {
+                return Ok(Some(to_return));
+            } else if to_return < root_node.items[0] {
                 current = right_node;
             } // otherwise current is already correct
+            // "clear" item, even though this does nothing
+            item = to_return;
         }
 
         while !current.head.leaf {
             // figure out which next node we need to get
             let mut next = *current.next.last().unwrap();
+            let mut next_index = current.head.len;
             if &item < current.items.last().unwrap() {
-                for (index, node_item) in current.items.iter().enumerate() {
-                    if &item < node_item {
-                        next = *current.next.get(index).unwrap();
+                for i in 0..current.head.len {
+                    if &item < current.items.get(i).unwrap() {
+                        next = *current.next.get(i).unwrap();
+                        next_index = i;
                         break;
-                    } else if &item == node_item {
-                        return Ok(true);
+                    } else if &item == current.items.get(i).unwrap() {
+                        current.items.push(item);
+                        current.items.swap(i, current.head.len);
+                        let node_item = current.items.pop().unwrap();
+                        try!(self.write_node(&current));
+                        return Ok(Some(node_item));
                     }
                 }
             } else if &item == current.items.last().unwrap() {
-                return Ok(true);
+                let node_item = current.items.pop().unwrap();
+                current.items.push(item);
+                try!(self.write_node(&current));
+                return Ok(Some(node_item));
             }
 
             // read the node
@@ -411,7 +422,6 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
                 // pop off the separator
                 sep = next_node.items.pop().unwrap();
-                // check end conditions now to satisfy borrow checker
                 let routing = {
                     if item < sep {
                         0
@@ -421,20 +431,20 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                         2
                     }
                 };
+                let to_return;
                 // update the len
                 next_node.head.len = next_node.items.len();
 
-                // insert the separator into the current node
-                let mut index = current.head.len;
-                for (i, item) in current.items.iter().enumerate() {
-                    if &sep < item {
-                        index = i;
-                        break;
+                current.next.insert(next_index + 1, right_node.head.idx);
+                current.items.insert(next_index, {
+                    if routing == 2 {
+                        to_return = sep;
+                        item
+                    } else {
+                        to_return = item;
+                        sep
                     }
-                }
-
-                current.next.insert(index + 1, right_node.head.idx);
-                current.items.insert(index, sep);
+                });
                 current.head.len += 1;
 
                 // write everything
@@ -448,8 +458,11 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 } else if routing == 1 {
                     current = right_node;
                 } else {
-                    return Ok(true);
+                    return Ok(Some(to_return));
                 }
+
+                // "clear" item
+                item = to_return;
             }
         }
 
@@ -467,7 +480,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         try!(self.write_node(&current));
 
         // done!
-        Ok(false)
+        Ok(None)
     }
 }
 
