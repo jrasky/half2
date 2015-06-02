@@ -384,7 +384,10 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             let mut next_node = try!(unsafe {self.read_node(next)});
 
             // see if we need to split the node
-            if next_node.head.len == self.head.size {
+            if next_node.head.len < self.head.size {
+                // just update the next node
+                current = next_node;
+            } else {
                 // create a new right node
                 // pick a median value
                 let index = next_node.head.len / 2 + 1;
@@ -447,9 +450,6 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 } else {
                     return Ok(true);
                 }
-            } else {
-                // just update the next node
-                current = next_node;
             }
         }
 
