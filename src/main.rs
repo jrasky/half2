@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
+use std::borrow::Borrow;
 
 use std::fs;
 use std::io;
@@ -113,8 +114,6 @@ impl<V: BufItem> Default for BufTree<io::Cursor<Vec<u8>>, V> {
 impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> {
     // TODO: insert size checks for all reads
     // TODO: check item indexes to ensure they aren't written to the wrong place
-    // TODO: make the inserts more efficient
-    // TODO: maybe implement the one-pass splitting method?
 
     pub fn new(buffer: T, size: usize) -> io::Result<BufTree<T, V>> {
         let mut tree = BufTree {
@@ -269,6 +268,41 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         }
     }
 
+    pub fn remove<K: Borrow<V>>(&mut self, as_item: K) -> io::Result<Option<V>> {
+        let item = as_item.borrow();
+
+        // check for a root node
+        let root_idx = match self.head.root {
+            None => {
+                return Ok(None);
+            },
+            Some(idx) => idx
+        };
+
+        // read the root node
+        let mut current = try!(unsafe {self.read_node(root_idx)});
+        // ensure there's at least one item in the root node
+        if current.items.is_empty() {
+            return Ok(None);
+        }
+
+        let mut next_idx;
+
+        // loop until we find the item or we hit a leaf
+        while match current.items.binary_search(item) {
+            Ok(idx) => {
+                next_idx = idx;
+                false
+            },
+            Err(idx) => {
+                next_idx = idx;
+                !current.head.leaf
+            }
+        } {
+            
+        }
+    }
+
     pub fn insert<K: Into<V>>(&mut self, to_item: K) -> io::Result<Option<V>> {
         let mut item = to_item.into();
 
@@ -368,28 +402,17 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
         while !current.head.leaf {
             // figure out which next node we need to get
-            let mut next = *current.next.last().unwrap();
-            let mut next_index = current.head.len;
-            if &item < current.items.last().unwrap() {
-                for i in 0..current.head.len {
-                    if &item < current.items.get(i).unwrap() {
-                        next = *current.next.get(i).unwrap();
-                        next_index = i;
-                        break;
-                    } else if &item == current.items.get(i).unwrap() {
-                        current.items.push(item);
-                        current.items.swap(i, current.head.len);
-                        let node_item = current.items.pop().unwrap();
-                        try!(self.write_node(&current));
-                        return Ok(Some(node_item));
-                    }
-                }
-            } else if &item == current.items.last().unwrap() {
-                let node_item = current.items.pop().unwrap();
-                current.items.push(item);
-                try!(self.write_node(&current));
-                return Ok(Some(node_item));
-            }
+            let next_index = match current.items.binary_search(&item) {
+                Ok(idx) => {
+                    current.items.push(item);
+                    current.items.swap(idx, current.head.len);
+                    let node_item = current.items.pop().unwrap();
+                    try!(self.write_node(&current));
+                    return Ok(Some(node_item));
+                },
+                Err(idx) => idx
+            };
+            let next = *current.next.get(next_index).unwrap();
 
             // read the node
             let mut next_node = try!(unsafe {self.read_node(next)});
@@ -467,20 +490,23 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         }
 
         // at this point current is a leaf node with space to insert our item
-        let mut index = current.head.len;
-        for (i, node_item) in current.items.iter().enumerate() {
-            if &item < node_item {
-                index = i;
-                break;
+        match current.items.binary_search(&item) {
+            Ok(idx) => {
+                // item was found in the list, swap them
+                current.items.push(item);
+                current.items.swap(idx, current.head.len);
+                let node_item = current.items.pop().unwrap();
+                try!(self.write_node(&current));
+                Ok(Some(node_item))
+            },
+            Err(idx) => {
+                // insert the item, preserving order
+                current.items.insert(idx, item);
+                current.head.len += 1;
+                try!(self.write_node(&current));
+                Ok(None)
             }
         }
-
-        current.items.insert(index, item);
-        current.head.len += 1;
-        try!(self.write_node(&current));
-
-        // done!
-        Ok(None)
     }
 }
 
