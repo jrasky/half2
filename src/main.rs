@@ -286,20 +286,64 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             return Ok(None);
         }
 
-        let mut next_idx;
+        let mut next_index;
 
         // loop until we find the item or we hit a leaf
         while match current.items.binary_search(item) {
             Ok(idx) => {
-                next_idx = idx;
+                next_index = idx;
                 false
             },
             Err(idx) => {
-                next_idx = idx;
+                next_index = idx;
                 !current.head.leaf
             }
         } {
-            
+            let next_idx = current.next[next_index];
+            let next = try!(unsafe {self.read_node(next_idx)});
+
+            // ensure that the next node can support a deletion
+            if next.head.len > self.head.size / 2 {
+                // it does, nothing to do here
+                current = next;
+            } else {
+                let index = next_index;
+                let mut sibling;
+                let mut distance = 1;
+
+                // try to find a sibling
+                loop {
+                    // check both sides
+                    if distance <= next_index {
+                        sibling = try!(unsafe {self.read_node(current.next[next_index - distance])});
+                        if sibling.head.len > self.head.size / 2 {
+                            index = next_index - distance;
+                            break;
+                        }
+                    }
+                    if next_index + distance <= current.head.len {
+                        sibling = try!(unsafe {self.read_node(current.next[next_index + distance])});
+                        if sibling.head.len > self.head.size / 2 {
+                            index = next_index + distance;
+                            break;
+                        }
+                    }
+
+                    // increment distance
+                    distance += 1;
+
+                    if distance > next_index && next_index + distance > current.head.len {
+                        // no suitable sibling found
+                        break;
+                    }
+                }
+
+                if index != next_index {
+                    // rotate around the sibling
+                } else {
+                    // merge with a sibling
+                }
+            }
         }
     }
 
