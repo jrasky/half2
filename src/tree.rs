@@ -160,22 +160,8 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             let next_buf = unsafe {slice::from_raw_parts(node.next.as_ptr() as *const _,
                                                          node.next.len() * ::std::u64::BYTES)};
             // write that
-            try!(self.buffer.write_all(next_buf));
-
-            if node.head.idx + (head_buf.len() + items_buf.len() + next_buf.len()) as u64 > self.head.last {
-                self.head.last = node.head.idx + (head_buf.len() + items_buf.len() + next_buf.len()) as u64;
-                // write the meta
-                try!(self.write_meta());
-            }
-
-            Ok(())
+            self.buffer.write_all(next_buf)
         } else {
-            if node.head.idx + (head_buf.len() + items_buf.len()) as u64 > self.head.last {
-                self.head.last = node.head.idx + (head_buf.len() + items_buf.len()) as u64;
-                // write the meta
-                try!(self.write_meta());
-            }
-
             Ok(())
         }
     }
@@ -253,20 +239,27 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
     }
 
     fn delete_node(&mut self, idx: u64) -> io::Result<()> {
-        // seek to the given index
-        try!(self.buffer.seek(io::SeekFrom::Start(idx)));
-        // create the gone item
-        let gone = BufGone {
-            idx: idx,
-            next: self.head.gone
-        };
-        // create the slice we care about
-        let buffer = unsafe {slice::from_raw_parts(&gone as *const _ as *const _,
-                                                   mem::size_of::<BufGone>())};
-        // write that to the buffer
-        try!(self.buffer.write_all(buffer));
-        // update tree metadata
-        self.head.gone = Some(idx);
+        if idx == self.head.last - (mem::size_of::<BufNodeHead>() as u64
+                                    + V::buf_len() as u64 *
+                                    (self.head.size * 2 + 1) as u64) {
+            // instead of writing a gone, just decrement last
+            self.head.last = idx;
+        } else {
+            // seek to the given index
+            try!(self.buffer.seek(io::SeekFrom::Start(idx)));
+            // create the gone item
+            let gone = BufGone {
+                idx: idx,
+                next: self.head.gone
+            };
+            // create the slice we care about
+            let buffer = unsafe {slice::from_raw_parts(&gone as *const _ as *const _,
+                                                       mem::size_of::<BufGone>())};
+            // write that to the buffer
+            try!(self.buffer.write_all(buffer));
+            // update tree metadata
+            self.head.gone = Some(idx);
+        }
         // write the metadata
         self.write_meta()
     }
