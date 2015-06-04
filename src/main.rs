@@ -250,6 +250,25 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         Ok(*gone_ptr.as_ref().unwrap())
     }
 
+    fn delete_node(&mut self, idx: u64) -> io::Result<()> {
+        // seek to the given index
+        try!(self.buffer.seek(io::SeekFrom::Start(idx)));
+        // create the gone item
+        let gone = BufGone {
+            idx: idx,
+            next: self.head.gone
+        };
+        // create the slice we care about
+        let buffer = unsafe {slice::from_raw_parts(&gone as *const _ as *const _,
+                                                   mem::size_of::<BufGone>())};
+        // write that to the buffer
+        try!(self.buffer.write_all(buffer));
+        // update tree metadata
+        self.head.gone = Some(idx);
+        // write the metadata
+        self.write_meta()
+    }
+
     fn new_idx(&mut self) -> io::Result<u64> {
         // return the next empty index for a node, incrementing the internal
         // counters as necessary
@@ -269,8 +288,6 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
     }
 
     pub fn remove<K: Borrow<V>>(&mut self, as_item: K) -> io::Result<Option<V>> {
-        let item = as_item.borrow();
-
         // check for a root node
         let root_idx = match self.head.root {
             None => {
@@ -286,63 +303,212 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             return Ok(None);
         }
 
-        let mut next_index;
+        let item = as_item.borrow();
+        let mut item_node = None;
+        let mut item_current = false;
+        let mut item_index = None;
+        let mut item_push = false;
 
         // loop until we find the item or we hit a leaf
-        while match current.items.binary_search(item) {
-            Ok(idx) => {
-                next_index = idx;
-                false
-            },
-            Err(idx) => {
-                next_index = idx;
-                !current.head.leaf
-            }
-        } {
+        while !current.head.leaf {
+            let next_index = {
+                if item_node.is_some() {
+                    current.head.len
+                } else {
+                    match current.items.binary_search(item) {
+                        Ok(idx) => {
+                            item_current = true;
+                            item_index = Some(idx);
+                            idx
+                        },
+                        Err(idx) => {
+                            idx
+                        }
+                    }
+                }
+            };
             let next_idx = current.next[next_index];
-            let next = try!(unsafe {self.read_node(next_idx)});
+            // this means the next after root node is read twice, oh well.
+            let mut next = try!(unsafe {self.read_node(next_idx)});
 
             // ensure that the next node can support a deletion
-            if next.head.len > self.head.size / 2 {
+            if next.head.len >= self.head.size / 2 {
                 // it does, nothing to do here
+                if item_current {
+                    if item_push {
+                        item_push = false;
+                    } else {
+                        item_current = false;
+                    }
+                    item_node = Some(current);
+                }
                 current = next;
             } else {
-                let index = next_index;
-                let mut sibling;
-                let mut distance = 1;
+                // favorize left siblings
+                let sibling_index = {
+                    if next_index > 0 {
+                        next_index - 1
+                    } else {
+                        1
+                    }
+                };
+                let mut sibling = try!(unsafe {self.read_node(current.next[sibling_index])});
 
-                // try to find a sibling
-                loop {
-                    // check both sides
-                    if distance <= next_index {
-                        sibling = try!(unsafe {self.read_node(current.next[next_index - distance])});
-                        if sibling.head.len > self.head.size / 2 {
-                            index = next_index - distance;
-                            break;
+                // can the sibling support a deletion?
+                if sibling.head.len >= self.head.size / 2 {
+                    // pull one from the sibling
+                    if sibling_index < next_index {
+                        // sibling is to the left
+                        let left_item = sibling.items.pop().unwrap();
+                        sibling.head.len -= 1;
+                        current.items.push(left_item);
+                        current.items.swap(sibling_index, current.head.len);
+                        let sep_item = current.items.pop().unwrap();
+                        next.items.insert(0, sep_item);
+                        next.head.len += 1;
+                        // move the next value if the sibling isn't a leaf
+                        if !sibling.head.leaf {
+                            let left_next = sibling.next.pop().unwrap();
+                            next.next.insert(0, left_next);
+                        }
+                    } else {
+                        // sibling is to the right
+                        let right_item = sibling.items.remove(0);
+                        sibling.head.len -= 1;
+                        current.items.push(right_item);
+                        current.items.swap(next_index, current.head.len);
+                        let sep_item = current.items.pop().unwrap();
+                        next.items.push(sep_item);
+                        if item_current {
+                            item_push = true;
+                            item_index = Some(next.head.len);
+                        }
+                        next.head.len += 1;
+                        // move the next value if the sibling isn't a leaf
+                        if !sibling.head.leaf {
+                            let right_next = sibling.next.remove(0);
+                            next.next.push(right_next);
                         }
                     }
-                    if next_index + distance <= current.head.len {
-                        sibling = try!(unsafe {self.read_node(current.next[next_index + distance])});
-                        if sibling.head.len > self.head.size / 2 {
-                            index = next_index + distance;
-                            break;
+
+                    // save everything
+                    try!(self.write_node(&sibling));
+                    try!(self.write_node(&next));
+                    try!(self.write_node(&current));
+
+                    // update current
+                    if item_current {
+                        if item_push {
+                            item_push = false;
+                        } else {
+                            item_current = false;
                         }
+                        item_node = Some(current);
                     }
-
-                    // increment distance
-                    distance += 1;
-
-                    if distance > next_index && next_index + distance > current.head.len {
-                        // no suitable sibling found
-                        break;
-                    }
-                }
-
-                if index != next_index {
-                    // rotate around the sibling
+                    current = next;
                 } else {
-                    // merge with a sibling
+                    // merge the two nodes
+                    if sibling_index < next_index {
+                        // sibling is to the left
+                        let sep_item = current.items.remove(sibling_index);
+                        current.next.remove(next_index);
+                        current.head.len -= 1;
+                        sibling.items.push(sep_item);
+                        sibling.items.extend(next.items);
+                        sibling.next.extend(next.next);
+                        sibling.head.len = sibling.items.len();
+
+                        // write everything
+                        // check to see if we've emptied the root node
+                        if current.head.len == 0 {
+                            // this only happens if current is the root node
+                            self.head.root = Some(sibling.head.idx);
+                            try!(self.write_meta());
+                            try!(self.delete_node(current.head.idx));
+                        } else {
+                            try!(self.write_node(&current));
+                        }
+
+                        // write the rest of the nodes
+                        try!(self.delete_node(next.head.idx));
+                        try!(self.write_node(&sibling));
+                        if item_current {
+                            if item_push {
+                                item_push = false;
+                            } else {
+                                item_current = false;
+                            }
+                            item_node = Some(current);
+                        }
+                        current = sibling;
+                    } else {
+                        // sibling is to the right
+                        let sep_item = current.items.remove(next_index);
+                        current.next.remove(sibling_index);
+                        current.head.len -= 1;
+                        next.items.push(sep_item);
+                        if item_current {
+                            item_push = true;
+                            item_index = Some(next.head.len);
+                        }
+                        next.items.extend(sibling.items);
+                        next.next.extend(sibling.next);
+                        next.head.len = next.items.len();
+
+                        // write everything
+                        // check to see if we've emptied the root node
+                        if current.head.len == 0 {
+                            // this only happens if current is the root node
+                            self.head.root = Some(next.head.idx);
+                            try!(self.write_meta());
+                            try!(self.delete_node(current.head.idx));
+                        } else {
+                            try!(self.write_node(&current));
+                        }
+
+                        try!(self.delete_node(sibling.head.idx));
+                        try!(self.write_node(&next));
+                        if item_current {
+                            if item_push {
+                                item_push = false;
+                            } else {
+                                item_current = false;
+                            }
+                            item_node = Some(current);
+                        }
+                        current = next;
+                    }
                 }
+            }
+        }
+
+        // at this point, current is a leaf node, supporting at least one deletion
+        match item_node {
+            None => {
+                // look for the item in the leaf
+                match current.items.binary_search(item) {
+                    Ok(idx) => {
+                        let node_item = current.items.remove(idx);
+                        current.head.len -= 1;
+                        try!(self.write_node(&current));
+                        Ok(Some(node_item))
+                    },
+                    Err(_) => {
+                        // item not in tree
+                        Ok(None)
+                    }
+                }
+            },
+            Some(mut node) => {
+                // swap the relevant item out
+                let sep = current.items.pop().unwrap();
+                current.head.len -= 1;
+                node.items.push(sep);
+                node.items.swap(item_index.unwrap(), node.head.len);
+                let node_item = node.items.pop().unwrap();
+                try!(self.write_node(&node));
+                try!(self.write_node(&current));
+                Ok(Some(node_item))
             }
         }
     }
