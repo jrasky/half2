@@ -112,9 +112,6 @@ impl<V: BufItem> Default for BufTree<io::Cursor<Vec<u8>>, V> {
 }
 
 impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> {
-    // TODO: insert size checks for all reads
-    // TODO: check item indexes to ensure they aren't written to the wrong place
-
     pub fn new(buffer: T, size: usize) -> io::Result<BufTree<T, V>> {
         let mut tree = BufTree {
             head: BufTreeHead {
@@ -204,6 +201,19 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             let ptr = head_buf.as_ptr() as *const BufNodeHead;
             ptr.as_ref().unwrap()
         };
+        
+        // check head idx
+        if head.idx != idx {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                      "Node header idx did not match given idx"));
+        }
+
+        // check head len
+        if head.len > self.head.size {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                      "Node header was of greater length than tree size"));
+        }
+
         let mut items_buf = vec![0; {
             if head.leaf {
                 // no further reads
@@ -284,6 +294,54 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 self.head.gone = gone.next;
                 Ok(idx)
             }
+        }
+    }
+
+    pub fn contains<K: Borrow<V>>(&mut self, as_item: K) -> io::Result<bool> {
+        match self.get(as_item) {
+            Err(e) => Err(e),
+            Ok(None) => Ok(false),
+            Ok(Some(_)) => Ok(true)
+        }
+    }
+
+    pub fn get<K: Borrow<V>>(&mut self, as_item: K) -> io::Result<Option<V>> {
+        // check for a root node
+        let root_idx = match self.head.root {
+            None => {
+                return Ok(None);
+            },
+            Some(idx) => idx
+        };
+
+        // read the root node
+        let mut current = try!(unsafe {self.read_node(root_idx)});
+        // ensure there's at least one item in the root node
+        if current.items.is_empty() {
+            return Ok(None);
+        }
+
+        let item = as_item.borrow();
+
+        // loop until we get to a leaf
+        loop {
+            let next_index = match current.items.binary_search(item) {
+                Ok(idx) => {
+                    // item found
+                    return Ok(Some(current.items.remove(idx)));
+                },
+                Err(idx) => {
+                    if current.head.leaf {
+                        // item not in tree
+                        return Ok(None);
+                    } else {
+                        // keep searching
+                        idx
+                    }
+                }
+            };
+
+            current = try!(unsafe {self.read_node(current.next[next_index])});
         }
     }
 
