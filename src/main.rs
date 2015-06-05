@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::cmp::Ordering;
 use std::hash::{hash, SipHasher};
-use std::io::{BufReader, BufRead};
+use std::io::{BufReader, BufRead, BufWriter};
 
 use std::fmt;
 use std::fs;
@@ -331,7 +331,7 @@ impl Logs {
         debug!("Creating tree at {:?} from {:?}", &dest_path, path);
 
         trace!("Creating destination buffer");
-        let dest = match fs::File::create(dest_path.join("content")) {
+        let dest = match fs::OpenOptions::new().read(true).write(true).create(true).open(dest_path.join("content")) {
             Err(e) => {
                 error!("Failed to create destination buffer: {}", e);
                 return Err(e);
@@ -343,7 +343,7 @@ impl Logs {
         };
 
         trace!("Creating tree object");
-        let mut tree: BufTree<_, IndexItem> = match BufTree::new(dest, 10) {
+        let mut tree: BufTree<_, IndexItem> = match BufTree::new(dest, 6) {
             Err(e) => {
                 error!("Failed to create tree: {}", e);
                 return Err(e);
@@ -377,6 +377,10 @@ impl Logs {
                 Err(e) => {
                     error!("Error reading line: {}", e);
                     return Err(e);
+                },
+                Ok(0) => {
+                    trace!("Finished with this file");
+                    break;
                 },
                 Ok(count) => {
                     trace!("Got new line");
@@ -437,6 +441,7 @@ impl Logs {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -498,7 +503,7 @@ fn main() {
     }
     
     info!("Walking current directory");
-    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2"]) {
+    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2", ".git", "target"]) {
         Ok(()) => {
             debug!("Walk successful");
         },

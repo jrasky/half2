@@ -181,7 +181,9 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
     unsafe fn read_node(&mut self, idx: u64) -> io::Result<BufNode<V>> {
         // unsafe because the data could be garbage
         // seek to the given position
+        trace!("Seeking");
         try!(self.buffer.seek(io::SeekFrom::Start(idx)));
+        trace!("Done seeking");
         // read the node
         // create a header object
         let mut head: BufNodeHead = mem::uninitialized();
@@ -189,7 +191,9 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         let head_buf = slice::from_raw_parts_mut(&mut head as *mut _ as *mut _,
                                                  mem::size_of::<BufNodeHead>());
         // read into that slice
+        trace!("Trying to read");
         try!(self.buffer.read(head_buf));
+        trace!("Finished reading");
         // forget that slice
         mem::forget(head_buf);
         
@@ -292,7 +296,8 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             None => {
                 let idx = self.head.last;
                 self.head.last += mem::size_of::<BufNodeHead>() as u64 +
-                    V::buf_len() as u64 * (self.head.size * 2 + 1) as u64;
+                    V::buf_len() as u64 * (self.head.size) as u64 +
+                    ::std::u64::BYTES as u64 * (self.head.size + 1) as u64;
                 Ok(idx)
             },
             Some(idx) => {
@@ -321,7 +326,9 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         };
 
         // read the root node
+        trace!("reading node");
         let mut current = try!(unsafe {self.read_node(root_idx)});
+        trace!("read node");
         // ensure there's at least one item in the root node
         if current.items.is_empty() {
             return Ok(None);
