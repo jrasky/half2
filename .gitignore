@@ -2,3 +2,4 @@
 target
 Cargo.lock
 .h2
+/perf.data

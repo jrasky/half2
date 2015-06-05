@@ -369,11 +369,12 @@ impl Logs {
 
         debug!("Inserting original lines into tree");
         // TODO: Improve this algorithm
-        let mut line = String::new();
+        let mut line = Vec::with_capacity(256);
         let mut idx = 0;
         loop {
-            line.clear();
-            match orig.read_line(&mut line) {
+            // set len to avoid dropping u8's
+            unsafe {line.set_len(0)};
+            match orig.read_until(b'\n', &mut line) {
                 Err(e) => {
                     error!("Error reading line: {}", e);
                     return Err(e);
@@ -503,7 +504,7 @@ fn main() {
     }
     
     info!("Walking current directory");
-    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2", ".git", "target"]) {
+    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2", ".git", "target", "perf.data"]) {
         Ok(()) => {
             debug!("Walk successful");
         },

@@ -6,31 +6,10 @@ use std::mem;
 use std::slice;
 use std::fmt;
 
-pub trait BufItem: Ord + fmt::Debug {
-    fn as_buf(&self) -> &[u8];
-    fn from_buf(&[u8]) -> Self;
-
-    // For some reason we can't use associated constants if all we have is a
-    // trait, so instead we must use static functions. Oh joy.
-    fn buf_len() -> usize;
-}
+pub trait BufItem: Copy + Ord + fmt::Debug {}
 
 // anything that implements copy can simply be addressed directly as a buffer
-impl<T: Copy + Ord + fmt::Debug> BufItem for T {
-    fn as_buf(&self) -> &[u8] {
-        unsafe {slice::from_raw_parts(self as *const T as *const _,
-                                      mem::size_of::<T>())}
-    }
-
-    fn from_buf(data: &[u8]) -> T {
-        let item = data.as_ptr() as *const T;
-        *(unsafe {item.as_ref().unwrap()})
-    }
-
-    fn buf_len() -> usize {
-        mem::size_of::<T>()
-    }
-}
+impl<T: Copy + Ord + fmt::Debug> BufItem for T {}
 
 #[derive(Debug)]
 pub struct BufTree<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> {
@@ -152,19 +131,20 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         // write that
         try!(self.buffer.write_all(head_buf));
         // create a buffer for the items
-        let mut items_buf = Vec::with_capacity({node.head.len} * V::buf_len());
-        for item in node.items.iter() {
-            items_buf.push_all(item.as_buf());
-        }
+        let items_buf = unsafe {slice::from_raw_parts(node.items.as_ptr() as *const _,
+                                                      node.items.len() * mem::size_of::<V>())};
         // write that
         try!(self.buffer.write_all(items_buf.as_ref()));
+        mem::forget(items_buf);
         
         if node.next.len() > 0 {
             // create the right kind of slice
             let next_buf = unsafe {slice::from_raw_parts(node.next.as_ptr() as *const _,
                                                          node.next.len() * ::std::u64::BYTES)};
             // write that
-            self.buffer.write_all(next_buf)
+            try!(self.buffer.write_all(next_buf));
+            mem::forget(next_buf);
+            Ok(())
         } else {
             Ok(())
         }
@@ -181,9 +161,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
     unsafe fn read_node(&mut self, idx: u64) -> io::Result<BufNode<V>> {
         // unsafe because the data could be garbage
         // seek to the given position
-        trace!("Seeking");
         try!(self.buffer.seek(io::SeekFrom::Start(idx)));
-        trace!("Done seeking");
         // read the node
         // create a header object
         let mut head: BufNodeHead = mem::uninitialized();
@@ -191,9 +169,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         let head_buf = slice::from_raw_parts_mut(&mut head as *mut _ as *mut _,
                                                  mem::size_of::<BufNodeHead>());
         // read into that slice
-        trace!("Trying to read");
         try!(self.buffer.read(head_buf));
-        trace!("Finished reading");
         // forget that slice
         mem::forget(head_buf);
         
@@ -211,7 +187,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                                               head.len, self.head.size)));
         }
 
-        let mut items_buf = vec![0; {
+        let vec_len = {
             if head.leaf == 0 {
                 // no further reads
                 head.len
@@ -220,18 +196,19 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 // position cursor correctly
                 self.head.size
             }
-        } * V::buf_len()];
+        } * mem::size_of::<V>();
+        let mut items_buf = Vec::with_capacity(vec_len);
+        items_buf.set_len(vec_len);
         try!(self.buffer.read(items_buf.as_mut()));
-        let mut items = Vec::with_capacity(head.len);
-        let mut item_ptr = items_buf.as_ptr();
-        for _ in 0..head.len {
-            items.push(V::from_buf(slice::from_raw_parts(item_ptr, V::buf_len())));
-            item_ptr = item_ptr.offset(V::buf_len() as isize);
-        }
-        let next;
+        let items = Vec::from_raw_parts(items_buf.as_mut_ptr() as *mut _,
+                                        head.len,
+                                        items_buf.capacity() / mem::size_of::<V>());
+        mem::forget(items_buf);
+        let mut next;
         if head.leaf == 0 {
             // create our buffer
-            next = vec![0; (head.len + 1)];
+            next = Vec::with_capacity((head.len + 1));
+            next.set_len(head.len + 1);
             // create a slice that points to it
             let next_buf = slice::from_raw_parts_mut(next.as_ptr() as *mut _,
                                                      (head.len + 1) * ::std::u64::BYTES);
@@ -265,7 +242,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
     fn delete_node(&mut self, idx: u64) -> io::Result<()> {
         if idx == self.head.last - (mem::size_of::<BufNodeHead>() as u64
-                                    + V::buf_len() as u64 *
+                                    + mem::size_of::<V>() as u64 *
                                     (self.head.size * 2 + 1) as u64) {
             // instead of writing a gone, just decrement last
             self.head.last = idx;
@@ -296,7 +273,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             None => {
                 let idx = self.head.last;
                 self.head.last += mem::size_of::<BufNodeHead>() as u64 +
-                    V::buf_len() as u64 * (self.head.size) as u64 +
+                    mem::size_of::<V>() as u64 * (self.head.size) as u64 +
                     ::std::u64::BYTES as u64 * (self.head.size + 1) as u64;
                 Ok(idx)
             },
