@@ -18,7 +18,8 @@ pub trait BufItem: Ord + fmt::Debug {
 // anything that implements copy can simply be addressed directly as a buffer
 impl<T: Copy + Ord + fmt::Debug> BufItem for T {
     fn as_buf(&self) -> &[u8] {
-        unsafe {slice::from_raw_parts(self as *const _ as *const _, mem::size_of::<T>())}
+        unsafe {slice::from_raw_parts(self as *const T as *const _,
+                                      mem::size_of::<T>())}
     }
 
     fn from_buf(data: &[u8]) -> T {
@@ -129,13 +130,15 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         // seek to the start of the file
         try!(buffer.seek(io::SeekFrom::Start(0)));
         // create our buffer
-        let mut head_buf = Vec::with_capacity(mem::size_of::<BufTreeHead>());
+        let mut head: BufTreeHead = mem::uninitialized();
+        let head_buf = slice::from_raw_parts_mut(&mut head as *mut _ as *mut _,
+                                                 mem::size_of::<BufTreeHead>());
         // read into it
-        try!(buffer.read(head_buf.as_mut()));
-        // transmute to our desired type
-        let head_ptr = head_buf.as_ptr() as *const BufTreeHead;
+        try!(buffer.read(head_buf));
+        // forget our buffer
+        mem::forget(head_buf);
         // return it
-        Ok(*head_ptr.as_ref().unwrap())
+        Ok(head)
     }
 
     fn write_node(&mut self, node: &BufNode<V>) -> io::Result<()> {
@@ -143,7 +146,8 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         try!(self.buffer.seek(io::SeekFrom::Start(node.head.idx)));
         // create the slice we care about
         let head_buf = unsafe {
-            slice::from_raw_parts(&node.head as *const _ as *const _, mem::size_of::<BufNodeHead>())
+            slice::from_raw_parts(&node.head as *const _ as *const _,
+                                  mem::size_of::<BufNodeHead>())
         };
         // write that
         try!(self.buffer.write_all(head_buf));
@@ -166,17 +170,28 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         }
     }
 
+    pub unsafe fn items_at_idx(&mut self, idx: u64) -> io::Result<Vec<V>> {
+        // sometimes we just want the items at an index
+        match self.read_node(idx) {
+            Err(e) => Err(e),
+            Ok(node) => Ok(node.items)
+        }
+    }
+
     unsafe fn read_node(&mut self, idx: u64) -> io::Result<BufNode<V>> {
         // unsafe because the data could be garbage
         // seek to the given position
         try!(self.buffer.seek(io::SeekFrom::Start(idx)));
         // read the node
-        let mut head_buf = vec![0; mem::size_of::<BufNodeHead>()];
-        try!(self.buffer.read(head_buf.as_mut()));
-        let head = {
-            let ptr = head_buf.as_ptr() as *const BufNodeHead;
-            ptr.as_ref().unwrap()
-        };
+        // create a header object
+        let mut head: BufNodeHead = mem::uninitialized();
+        // create a slice that points to it
+        let head_buf = slice::from_raw_parts_mut(&mut head as *mut _ as *mut _,
+                                                 mem::size_of::<BufNodeHead>());
+        // read into that slice
+        try!(self.buffer.read(head_buf));
+        // forget that slice
+        mem::forget(head_buf);
         
         // check head idx
         if head.idx != idx {
@@ -209,16 +224,22 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
             items.push(V::from_buf(slice::from_raw_parts(item_ptr, V::buf_len())));
             item_ptr = item_ptr.offset(V::buf_len() as isize);
         }
-        let mut next;
+        let next;
         if head.leaf == 0 {
-            let mut next_buf = vec![0; (head.len + 1) * ::std::u64::BYTES];
-            try!(self.buffer.read(next_buf.as_mut()));
-            next = Vec::from_raw_buf(next_buf.as_ptr() as *const u64, head.len + 1);
+            // create our buffer
+            next = vec![0; (head.len + 1)];
+            // create a slice that points to it
+            let next_buf = slice::from_raw_parts_mut(next.as_ptr() as *mut _,
+                                                     (head.len + 1) * ::std::u64::BYTES);
+            // read into the slice
+            try!(self.buffer.read(next_buf));
+            // forget the slice
+            mem::forget(next_buf);
         } else {
             next = vec![];
         }
         Ok(BufNode {
-            head: *head,
+            head: head,
             items: items,
             next: next
         })
@@ -557,6 +578,15 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
     }
 
     pub fn insert<K: Into<V>>(&mut self, to_item: K) -> io::Result<Option<V>> {
+        match unsafe {self.insert_idx(to_item)} {
+            Err(e) => Err(e),
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(item)) => Ok(Some(item))
+        }
+    }
+
+    pub unsafe fn insert_idx<K: Into<V>>(&mut self, to_item: K) -> io::Result<Result<u64, V>> {
+        // there are certain cases where we care to know where the item was written
         let mut item = to_item.into();
 
         // check for a root node
@@ -577,13 +607,13 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 self.head.root = Some(node.head.idx);
                 // save the metadata
                 try!(self.write_meta());
-                return Ok(None);
+                return Ok(Ok(node.head.idx));
             },
             Some(idx) => idx
         };
 
         // read the root node
-        let mut current = try!(unsafe {self.read_node(root_idx)});
+        let mut current = try!(self.read_node(root_idx));
         let mut sep;
 
         // check if the root node is full
@@ -645,7 +675,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
 
             // update current
             if finished {
-                return Ok(Some(to_return));
+                return Ok(Err(to_return));
             }
             // "clear" item, even though this does nothing
             item = to_return;
@@ -661,14 +691,14 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                     current.items.swap(idx, current.head.len);
                     let node_item = current.items.pop().unwrap();
                     try!(self.write_node(&current));
-                    return Ok(Some(node_item));
+                    return Ok(Err(node_item));
                 },
                 Err(idx) => idx
             };
             let next = *current.next.get(next_index).unwrap();
 
             // read the node
-            let mut next_node = try!(unsafe {self.read_node(next)});
+            let mut next_node = try!(self.read_node(next));
 
             // see if we need to split the node
             if next_node.head.len < self.head.size {
@@ -734,7 +764,7 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 } else if routing == 1 {
                     current = right_node;
                 } else {
-                    return Ok(Some(to_return));
+                    return Ok(Err(to_return));
                 }
 
                 // "clear" item
@@ -750,14 +780,14 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
                 current.items.swap(idx, current.head.len);
                 let node_item = current.items.pop().unwrap();
                 try!(self.write_node(&current));
-                Ok(Some(node_item))
+                Ok(Err(node_item))
             },
             Err(idx) => {
                 // insert the item, preserving order
                 current.items.insert(idx, item);
                 current.head.len += 1;
                 try!(self.write_node(&current));
-                Ok(None)
+                Ok(Ok(current.head.idx))
             }
         }
     }

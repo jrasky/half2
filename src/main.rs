@@ -1,9 +1,8 @@
 #![feature(core)]
+#![feature(hash)]
 #![feature(collections)]
 #![feature(dir_entry_ext)]
-#![feature(symlink_metadata)]
 #![feature(path_relative_from)]
-#![feature(file_type)]
 #![feature(associated_consts)]
 #![feature(test)]
 #[macro_use]
@@ -14,15 +13,24 @@ extern crate test;
 // general TODO:
 // - create our own error type and use that everywhere
 // - unify error handling to be more descriptive (replace try!, unwrap)
+// - move fileops into a separate module so we can mock it out for testing
 
 use std::path::PathBuf;
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::cmp::Ordering;
+use std::hash::{hash, SipHasher};
+use std::io::{BufReader, BufRead};
 
+use std::fmt;
 use std::fs;
 use std::io;
 
+use tree::*;
+
 mod tree;
+
+const INDEX_PLACES_SIZE: usize = 8;
 
 #[derive(Debug)]
 struct Stage {
@@ -31,13 +39,13 @@ struct Stage {
 
 #[derive(Debug)]
 struct Checkout {
-    path: PathBuf
+    pub path: PathBuf
 }
 
-#[derive(Debug)]
 struct PathInfo {
     path: PathBuf,
-    pub id: PathBuf
+    pub id: PathBuf,
+    pub metadata: fs::Metadata
 }
 
 #[derive(Debug)]
@@ -45,37 +53,115 @@ struct Logs {
     path: PathBuf
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IndexNext {
+    hash: u64,
+    // idx of node in tree
+    idx: u64
+}
+
+// TODO: Improve this structure to include more caching
+struct IndexItem {
+    hash: u64,
+    order: usize,
+    count: usize,
+    places: [u64; INDEX_PLACES_SIZE]
+}
+
+impl fmt::Debug for IndexItem {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        try!(write!(f, "IndexItem {{ hash: {:?}, order: {:?}, count: {:?}, places: [",
+                    self.hash, self.order, self.count));
+        if self.count > 0 {
+            try!(write!(f, "{:?}", self.places[0]));
+        }
+        if self.count > 1 {
+            for i in 1..self.count {
+                try!(write!(f, ", {:?}", self.places[i]));
+            }
+        }
+        write!(f, "] }}")
+    }
+}
+
+impl Default for IndexItem {
+    fn default() -> IndexItem {
+        IndexItem {
+            hash: 0,
+            order: 0,
+            count: 0,
+            places: [0; INDEX_PLACES_SIZE]
+        }
+    }
+}
+
+impl Copy for IndexItem {}
+
+impl Clone for IndexItem {
+    fn clone(&self) -> IndexItem {
+        *self
+    }
+}
+
+impl Eq for IndexItem {}
+
+impl PartialEq for IndexItem {
+    fn eq(&self, other: &IndexItem) -> bool {
+        self.hash == other.hash && self.count == other.count
+    }
+}
+
+impl Ord for IndexItem {
+    fn cmp(&self, other: &IndexItem) -> Ordering {
+        if self.hash < other.hash {
+            Ordering::Less
+        } else if self.hash > other.hash {
+            Ordering::Greater
+        } else if self.count < other.count {
+            Ordering::Less
+        } else if self.count > other.count {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl PartialOrd for IndexItem {
+    fn partial_cmp(&self, other: &IndexItem) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for PathInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "PathInfo {{ path: {:?}, id: {:?}, metadata: {{...}} }}", self.path, self.id)
+    }
+}
+
 impl PathInfo {
-    pub fn new<T: Into<PathBuf>, V: Into<PathBuf>>(path: T, id: V) -> PathInfo {
+    pub fn new<T: Into<PathBuf>, V: Into<PathBuf>>(path: T, id: V, metadata: fs::Metadata) -> PathInfo {
         PathInfo {
             path: path.into(),
-            id: id.into()
+            id: id.into(),
+            metadata: metadata
         }
     }
 
-    pub fn metadata(&self) -> Result<fs::Metadata, io::Error> {
-        fs::symlink_metadata(&self.path)
+    pub fn get_buffer(&self) -> Result<fs::File, io::Error> {
+        fs::File::open(&self.path)
     }
 
     pub fn copy<T: Into<PathBuf>>(&self, to: T) -> Result<(), io::Error> {
-        match self.metadata() {
-            Err(e) => {
-                error!("Failed to get metadata for path {:?}: {}", self.path, e);
-                Err(e)
-            },
-            Ok(data) => {
-                trace!("Successfully got metadata");
-                if data.is_dir() {
-                    trace!("Copying as directory");
-                    self.copy_dir(to)
-                } else if data.is_file() {
-                    trace!("Copying as file");
-                    self.copy_file(to)
-                } else {
-                    error!("{} is neither a file or a directory", self.path.display());
-                    unimplemented!()
-                }
-            }
+        if self.metadata.is_dir() {
+            trace!("Copying as directory");
+            self.copy_dir(to)
+        } else if self.metadata.is_file() {
+            trace!("Copying as file");
+            self.copy_file(to)
+        } else {
+            error!("{} is neither a file nor a directory", self.path.display());
+            unimplemented!()
         }
     }
 
@@ -154,8 +240,9 @@ impl Stage {
     }
 
     pub fn add_path(&mut self, path: &PathInfo) -> Result<(), io::Error> {
-        // "add" means update. If anything already exists, it's overwritten.
+        // initial implementation. Overwrites anything.
         info!("Adding path {:?}", path);
+        // copy the path to the stage
         path.copy(&self.path)
     }
 }
@@ -190,91 +277,6 @@ impl Checkout {
             }
         }
     }
-
-    pub fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(&self, stage: &mut Stage, path: T, ignore: V)
-                                                            -> Result<(), io::Error> where V::Item: Into<PathBuf> {
-        let mut to_visit = vec![self.path.join(path.into())];
-        let to_ignore: HashSet<PathBuf> = HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}));
-
-        info!("Copying directory tree");
-        while !to_visit.is_empty() {
-            trace!("Popping directory from queue");
-            let dir = to_visit.pop().unwrap();
-            debug!("Reading directory {:?}", dir);
-            for item in match fs::read_dir(dir) {
-                Ok(iter) => {
-                    trace!("Got directory iterator");
-                    iter
-                },
-                Err(e) => {
-                    error!("Failed to read directory: {}", e);
-                    return Err(e);
-                }
-            } {
-                let entry = match item {
-                    Ok(item) => {
-                        trace!("No new error");
-                        item
-                    },
-                    Err(e) => {
-                        error!("Error reading directory: {}", e);
-                        return Err(e);
-                    }
-                };
-
-                trace!("Getting path relative to checkout directory");
-                let id = match entry.path().relative_from(&self.path) {
-                    Some(id) => {
-                        trace!("Got path relative_from successfully");
-                        PathBuf::from(id)
-                    },
-                    None => {
-                        panic!("Failed to get path relative to checkout path");
-                    }
-                };
-
-                trace!("Entry path: {:?}", entry.path());
-                if to_ignore.contains(&id) {
-                    // ignore our own directory
-                    trace!("Path was in ignore set");
-                    continue;
-                }
-
-                trace!("Getting file type");
-                match entry.file_type() {
-                    Ok(ref ty) if ty.is_dir() => {
-                        debug!("Adding path to visit queue");
-                        to_visit.push(entry.path());
-                    },
-                    Ok(_) => {
-                        trace!("Not adding path to visit queue");
-                    },
-                    Err(e) => {
-                        error!("Could not get file type: {}", e);
-                        return Err(e);
-                    }
-                }
-                
-                trace!("Creating path info object");
-                let info = PathInfo::new(entry.path(), id);
-
-                debug!("Adding path to stage");
-                match stage.add_path(&info) {
-                    Ok(()) => {
-                        trace!("Add path succeeded");
-                    },
-                    Err(e) => {
-                        error!("Add path failed: {}", e);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        trace!("Init finished");
-        Ok(())
-    }
-
 }
 
 impl Default for Logs {
@@ -308,6 +310,134 @@ impl Logs {
         }
     }
 
+    pub fn add_path(&mut self, path: &PathInfo) -> io::Result<()> {
+        let dest_path = self.path.join(&path.id);
+        if !path.metadata.is_file() {
+            // only create an index for a file
+            return Ok(());
+        }
+
+        debug!("Creating log directory");
+        match fs::create_dir_all(&dest_path) {
+            Err(e) => {
+                error!("Failed to create parent directory: {}", e);
+                return Err(e);
+            },
+            Ok(_) => {
+                trace!("Parent directory created");
+            }
+        }
+
+        debug!("Creating tree at {:?} from {:?}", &dest_path, path);
+
+        trace!("Creating destination buffer");
+        let dest = match fs::File::create(dest_path.join("content")) {
+            Err(e) => {
+                error!("Failed to create destination buffer: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Successfully created destination buffer");
+                b
+            }
+        };
+
+        trace!("Creating tree object");
+        let mut tree: BufTree<_, IndexItem> = match BufTree::new(dest, 10) {
+            Err(e) => {
+                error!("Failed to create tree: {}", e);
+                return Err(e);
+            },
+            Ok(t) => {
+                trace!("Successfully created tree");
+                t
+            }
+        };
+
+        trace!("Opening original file");
+        let mut orig = match path.get_buffer() {
+            Err(e) => {
+                error!("Failed to open file: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Successfully opened file");
+                // wrap in a buffreader so we can read_line
+                BufReader::new(b)
+            }
+        };
+
+        debug!("Inserting original lines into tree");
+        // TODO: Improve this algorithm
+        let mut line = String::new();
+        let mut idx = 0;
+        loop {
+            line.clear();
+            match orig.read_line(&mut line) {
+                Err(e) => {
+                    error!("Error reading line: {}", e);
+                    return Err(e);
+                },
+                Ok(count) => {
+                    trace!("Got new line");
+                    idx += count as u64;
+                }
+            };
+            trace!("Creating initial item");
+            let mut item = IndexItem {
+                hash: hash::<_, SipHasher>(&line),
+                order: 0,
+                count: 1,
+                places: [idx; INDEX_PLACES_SIZE],
+            };
+            trace!("Merging with tree");
+            item = match tree.get(&item) {
+                Err(e) => {
+                    error!("Error getting item: {}", e);
+                    return Err(e);
+                },
+                Ok(None) => {
+                    trace!("No matching item");
+                    item
+                },
+                Ok(Some(mut item)) => {
+                    trace!("Found a matching item, merging");
+                    while item.count == INDEX_PLACES_SIZE {
+                        item.order += 1;
+                        item = match tree.get(&item) {
+                            Err(e) => {
+                                error!("Error getting item: {}", e);
+                                return Err(e);
+                            },
+                            Ok(None) => {
+                                trace!("Creating new item");
+                                item.count = 1;
+                                item.places[0] = idx;
+                                item
+                            },
+                            Ok(Some(mut item)) => {
+                                trace!("Found follow-up item");
+                                item.places[item.count] = idx;
+                                item.count += 1;
+                                item
+                            }
+                        }
+                    }
+                    item
+                }
+            };
+            trace!("Inserting item {:?}", &item);
+            match tree.insert(item) {
+                Err(e) => {
+                    error!("Error inserting item: {}", e);
+                    return Err(e);
+                },
+                Ok(_) => {
+                    trace!("Successfully inserted item");
+                }
+            }
+        }
+    }
 }
 
 fn main() {
@@ -368,7 +498,7 @@ fn main() {
     }
     
     info!("Walking current directory");
-    match checkout.stage_dir_all(&mut stage, PathBuf::from("."), vec![".h2"]) {
+    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2"]) {
         Ok(()) => {
             debug!("Walk successful");
         },
@@ -392,5 +522,104 @@ fn init() -> Result<(), io::Error> {
         }
     }
 
+    Ok(())
+}
+
+fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(checkout: &Checkout, logs: &mut Logs, stage: &mut Stage, path: T, ignore: V)
+                                                        -> Result<(), io::Error> where V::Item: Into<PathBuf> {
+    let mut to_visit = vec![checkout.path.join(path.into())];
+    let to_ignore: HashSet<PathBuf> = HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}));
+
+    info!("Copying directory tree");
+    while !to_visit.is_empty() {
+        trace!("Popping directory from queue");
+        let dir = to_visit.pop().unwrap();
+        debug!("Reading directory {:?}", dir);
+        for item in match fs::read_dir(dir) {
+            Ok(iter) => {
+                trace!("Got directory iterator");
+                iter
+            },
+            Err(e) => {
+                error!("Failed to read directory: {}", e);
+                return Err(e);
+            }
+        } {
+            let entry = match item {
+                Ok(item) => {
+                    trace!("No new error");
+                    item
+                },
+                Err(e) => {
+                    error!("Error reading directory: {}", e);
+                    return Err(e);
+                }
+            };
+
+            trace!("Getting path relative to checkout directory");
+            let id = match entry.path().relative_from(&checkout.path) {
+                Some(id) => {
+                    trace!("Got path relative_from successfully");
+                    PathBuf::from(id)
+                },
+                None => {
+                    panic!("Failed to get path relative to checkout path");
+                }
+            };
+
+            trace!("Entry path: {:?}", entry.path());
+            if to_ignore.contains(&id) {
+                // ignore our own directory
+                trace!("Path was in ignore set");
+                continue;
+            }
+
+            trace!("Getting file metadata");
+            let metadata = match entry.metadata() {
+                Ok(data) => {
+                    trace!("Got metadata");
+                    data
+                },
+                Err(e) => {
+                    error!("Could not get file metadata: {}", e);
+                    return Err(e);
+                }
+            };
+
+            if metadata.is_dir() {
+                trace!("Adding path to visit queue");
+                to_visit.push(entry.path());
+            } else {
+                trace!("Not adding path to visit queue");
+            }
+            
+            trace!("Creating path info object");
+            let info = PathInfo::new(entry.path(), id, metadata);
+
+            debug!("Adding path to stage");
+            match stage.add_path(&info) {
+                Ok(()) => {
+                    trace!("Add path succeeded");
+                },
+                Err(e) => {
+                    error!("Add path failed: {}", e);
+                    return Err(e);
+                }
+            }
+
+            debug!("Creating file index");
+            match logs.add_path(&info) {
+                Ok(()) => {
+                    trace!("Index creation successful");
+                },
+                Err(e) => {
+                    error!("Index creation failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    trace!("Init finished");
     Ok(())
 }
