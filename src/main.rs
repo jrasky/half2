@@ -9,6 +9,7 @@
 extern crate log;
 extern crate env_logger;
 extern crate test;
+extern crate rustc_serialize;
 
 // general TODO:
 // - create our own error type and use that everywhere
@@ -20,17 +21,23 @@ use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::cmp::Ordering;
 use std::hash::{hash, SipHasher};
-use std::io::{BufReader, BufRead, BufWriter};
+use std::io::{BufReader, BufRead, Read, Write};
+
+use rustc_serialize::json;
 
 use std::fmt;
 use std::fs;
 use std::io;
+use std::mem;
+use std::env;
 
 use tree::*;
 
 mod tree;
 
-const INDEX_PLACES_SIZE: usize = 8;
+const INDEX_PLACES_SIZE: usize = 4;
+const FILE_TREE_WIDTH: usize = 6;
+const FILE_BLOCK_LENGTH: usize = 1;
 
 #[derive(Debug)]
 struct Stage {
@@ -54,10 +61,9 @@ struct Logs {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct IndexNext {
-    hash: u64,
-    // idx of node in tree
-    idx: u64
+struct IndexPlace {
+    node: usize,
+    offset: isize
 }
 
 // TODO: Improve this structure to include more caching
@@ -65,7 +71,12 @@ struct IndexItem {
     hash: u64,
     order: usize,
     count: usize,
-    places: [u64; INDEX_PLACES_SIZE]
+    places: [IndexPlace; INDEX_PLACES_SIZE]
+}
+
+#[derive(RustcDecodable, RustcEncodable)]
+struct FileMeta {
+    node_count: usize
 }
 
 impl fmt::Debug for IndexItem {
@@ -76,22 +87,11 @@ impl fmt::Debug for IndexItem {
             try!(write!(f, "{:?}", self.places[0]));
         }
         if self.count > 1 {
-            for i in 1..self.count {
+            for i in 1..self.count as usize {
                 try!(write!(f, ", {:?}", self.places[i]));
             }
         }
         write!(f, "] }}")
-    }
-}
-
-impl Default for IndexItem {
-    fn default() -> IndexItem {
-        IndexItem {
-            hash: 0,
-            order: 0,
-            count: 0,
-            places: [0; INDEX_PLACES_SIZE]
-        }
     }
 }
 
@@ -107,7 +107,7 @@ impl Eq for IndexItem {}
 
 impl PartialEq for IndexItem {
     fn eq(&self, other: &IndexItem) -> bool {
-        self.hash == other.hash && self.count == other.count
+        self.hash == other.hash && self.order == other.order
     }
 }
 
@@ -117,9 +117,9 @@ impl Ord for IndexItem {
             Ordering::Less
         } else if self.hash > other.hash {
             Ordering::Greater
-        } else if self.count < other.count {
+        } else if self.order < other.order {
             Ordering::Less
-        } else if self.count > other.count {
+        } else if self.order > other.order {
             Ordering::Greater
         } else {
             Ordering::Equal
@@ -310,6 +310,227 @@ impl Logs {
         }
     }
 
+    pub fn diff_path(&self, path: &PathInfo) -> io::Result<()> {
+        let dest_path = self.path.join(&path.id);
+        if !path.metadata.is_file() {
+            // only diff files and then a change
+            error!("Path was not a file: {:?}", path);
+            return Ok(());
+        } else {
+            info!("Diffing file: {:?}", path);
+        }
+
+        debug!("Reading tree at {:?} for file {:?}", &dest_path, path);
+
+        trace!("Opening meta info file");
+        let mut meta_buf = match fs::OpenOptions::new().read(true).write(false).open(dest_path.join("meta")) {
+            Err(e) => {
+                error!("Failed to open meta file: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Successfully opened meta file");
+                b
+            }
+        };
+
+        let mut meta_str = String::new();
+        trace!("Reading metadata file");
+        match meta_buf.read_to_string(&mut meta_str) {
+            Err(e) => {
+                error!("Failed to read meta info: {}", e);
+                return Err(e);
+            },
+            Ok(s) => {
+                trace!("Successfully read meta file");
+                s
+            }
+        };
+
+        trace!("Decoding object");
+        let mut meta: FileMeta = match json::decode(meta_str.as_ref()) {
+            Err(e) => {
+                panic!("Failed to decode meta object: {}", e);
+            },
+            Ok(obj) => {
+                trace!("Successfully decoded meta object");
+                obj
+            }
+        };
+
+        trace!("Opening tree file");
+        let tree_buf = match fs::File::open(dest_path.join("content")) {
+            Err(e) => {
+                error!("Failed to open content buffer: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Opened tree file");
+                b
+            }
+        };
+
+        trace!("Creating tree object");
+
+        let mut tree: BufTree<_, IndexItem> = match unsafe {BufTree::from_buffer(tree_buf)} {
+            Err(e) => {
+                error!("Failed to create tree object: {}", e);
+                return Err(e);
+            },
+            Ok(t) => {
+                trace!("Tree object created successfully");
+                t
+            }
+        };
+
+        debug!("Opening original file");
+        let mut orig = match path.get_buffer() {
+            Err(e) => {
+                error!("Failed to open file: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Successfully opened file");
+                // wrap in a buffreader so we can read_line
+                BufReader::new(b)
+            }
+        };
+
+        debug!("Comparing lines");
+        let mut offset: isize = 0;
+        let mut new_offset: isize = 0;
+        let mut counter = 0;
+        let mut line = Vec::new();
+        loop {
+            unsafe {line.set_len(0)};
+            trace!("Reading line");
+            match orig.read_until(b'\n', &mut line) {
+                Ok(0) => {
+                    trace!("Done with this file");
+                    break;
+                },
+                Ok(_) => {
+                    trace!("Got new line: {:?}", String::from_utf8_lossy(&line));
+                },
+                Err(e) => {
+                    error!("Failed to read line: {}", e);
+                    return Err(e);
+                }
+            }
+            trace!("Creating initial item");
+            debug!("Counter {}: {:?}", counter, String::from_utf8_lossy(&line));
+            let mut item = IndexItem {
+                hash: hash::<_, SipHasher>(&line),
+                order: 0,
+                count: 0,
+                places: unsafe {mem::zeroed()}
+            };
+            trace!("Searching in tree");
+            match tree.get(&item) {
+                Err(e) => {
+                    error!("Failed to get item: {}", e);
+                    return Err(e);
+                },
+                Ok(None) => {
+                    info!("New node {}: {:?}", meta.node_count, String::from_utf8_lossy(&line));
+                    if offset != meta.node_count as isize - counter as isize {
+                        info!("Counter {}: offset {}", (counter - 1),
+                              meta.node_count as isize - counter as isize - offset);
+                        new_offset += meta.node_count as isize - counter as isize - offset;
+                        offset = meta.node_count as isize - counter as isize;
+                    }
+                    meta.node_count += 1;
+                },
+                Ok(Some(tree_item)) => {
+                    trace!("Found existing item: {:?}", &tree_item);
+                    // iterate through the places we have
+                    let mut next = None;
+                    let mut place = tree_item.places[0];
+                    let mut diff = new_offset + tree_item.places[0].node as isize - counter as isize - offset;
+                    debug!("Starting place: {:?}", place);
+                    debug!("Starting difference: {}", diff);
+                    for i in 0..tree_item.count {
+                        debug!("Considering place {:?}", tree_item.places[i]);
+                        if counter as isize + offset + tree_item.places[i].offset == tree_item.places[i].node as isize {
+                            // we've foun a match
+                            next = Some(tree_item.places[i]);
+                            debug!("Found a match: {:?}", &tree_item.places[i]);
+                            break;
+                        } else if (new_offset + tree_item.places[i].node as isize -
+                                   counter as isize - offset).abs() < diff.abs() {
+                            diff = new_offset + tree_item.places[i].node as isize -
+                                counter as isize - offset;
+                            place = tree_item.places[i];
+                            debug!("offset {} new_offset {} place.offset {} place.node {}", offset, new_offset, place.offset, place.node);
+                            debug!("Found a better solution {}: {:?}", diff, place);
+                        }
+                    }
+
+                    // iterate through the next ones if they exist
+                    if next.is_none() {
+                        trace!("Checking for sub-items");
+                    }
+                    while next.is_none() {
+                        item.order += 1;
+                        match tree.get(&item) {
+                            Err(e) => {
+                                error!("Failed to get item: {}", e);
+                                return Err(e);
+                            },
+                            Ok(None) => {
+                                trace!("Iterated through all sub-items");
+                                break;
+                            },
+                            Ok(Some(other_item)) => {
+                                trace!("Found other sub-item: {:?}", &other_item);
+                                for i in 0..other_item.count {
+                                    debug!("Considering place {:?}", other_item.places[i]);
+                                    if counter as isize + offset + other_item.places[i].offset == other_item.places[i].node as isize {
+                                        // we've foun a match
+                                        next = Some(other_item.places[i]);
+                                        debug!("Found a match: {:?}", &other_item.places[i]);
+                                        break;
+                                    } else if (new_offset + other_item.places[i].node as isize -
+                                               counter as isize - offset).abs() < diff.abs() {
+                                        diff = new_offset + other_item.places[i].node as isize -
+                                            counter as isize - offset;
+                                        place = tree_item.places[i];
+                                        debug!("offset {} new_offset {} place.offset {} place.node {}", offset, new_offset, place.offset, place.node);
+                                        debug!("Found a better solution {}: {:?}", diff, place);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    trace!("Finalizing decision");
+                    match next {
+                        Some(place) => {
+                            // our best path doesn't need an offset
+                            trace!("Found matching place");
+                            offset += place.offset;
+                        },
+                        None => {
+                            // new next element
+                            trace!("No matching place, creating new one");
+                            debug!("Closest place: {:?}", place);
+                            info!("Counter {}: offset {}", (counter - 1),
+                                  place.node as isize - counter as isize - offset);
+                            new_offset += place.node as isize - counter as isize - offset;
+                            offset = place.node as isize - counter as isize;
+                        }
+                    }
+                }
+            }
+
+            trace!("Incrementing counter");
+            counter += 1;
+        }
+
+        // TODO: actually change the tree to match, write out info
+        Ok(())
+    }
+
     pub fn add_path(&mut self, path: &PathInfo) -> io::Result<()> {
         let dest_path = self.path.join(&path.id);
         if !path.metadata.is_file() {
@@ -330,6 +551,18 @@ impl Logs {
 
         debug!("Creating tree at {:?} from {:?}", &dest_path, path);
 
+        trace!("Creating meta file");
+        let mut meta = match fs::File::create(dest_path.join("meta")) {
+            Err(e) => {
+                error!("Failed to create meta buffer: {}", e);
+                return Err(e);
+            },
+            Ok(b) => {
+                trace!("Successfully created meta buffer");
+                b
+            }
+        };
+
         trace!("Creating destination buffer");
         let dest = match fs::OpenOptions::new().read(true).write(true).create(true).open(dest_path.join("content")) {
             Err(e) => {
@@ -343,7 +576,7 @@ impl Logs {
         };
 
         trace!("Creating tree object");
-        let mut tree: BufTree<_, IndexItem> = match BufTree::new(dest, 6) {
+        let mut tree: BufTree<_, IndexItem> = match BufTree::new(dest, FILE_TREE_WIDTH) {
             Err(e) => {
                 error!("Failed to create tree: {}", e);
                 return Err(e);
@@ -368,78 +601,101 @@ impl Logs {
         };
 
         debug!("Inserting original lines into tree");
-        // TODO: Improve this algorithm
-        let mut line = Vec::with_capacity(256);
-        let mut idx = 0;
+        let mut line = Vec::new();
+        let mut counter = 0;
+        let mut item;
         loop {
-            // set len to avoid dropping u8's
             unsafe {line.set_len(0)};
+            trace!("Reading line");
             match orig.read_until(b'\n', &mut line) {
-                Err(e) => {
-                    error!("Error reading line: {}", e);
-                    return Err(e);
-                },
                 Ok(0) => {
-                    trace!("Finished with this file");
+                    trace!("Done with this file");
                     break;
                 },
-                Ok(count) => {
-                    trace!("Got new line");
-                    idx += count as u64;
+                Ok(_) => {
+                    trace!("Got new line: {:?}", String::from_utf8_lossy(&line));
+                },
+                Err(e) => {
+                    error!("Failed to read line: {}", e);
+                    return Err(e);
                 }
-            };
+            }
             trace!("Creating initial item");
-            let mut item = IndexItem {
+            item = IndexItem {
                 hash: hash::<_, SipHasher>(&line),
                 order: 0,
-                count: 1,
-                places: [idx; INDEX_PLACES_SIZE],
+                count: 0,
+                // create zeroed memory so it compresses better
+                places: unsafe {mem::zeroed()}
             };
             trace!("Merging with tree");
-            item = match tree.get(&item) {
-                Err(e) => {
-                    error!("Error getting item: {}", e);
-                    return Err(e);
-                },
-                Ok(None) => {
-                    trace!("No matching item");
-                    item
-                },
-                Ok(Some(mut item)) => {
-                    trace!("Found a matching item, merging");
-                    while item.count == INDEX_PLACES_SIZE {
-                        item.order += 1;
-                        item = match tree.get(&item) {
-                            Err(e) => {
-                                error!("Error getting item: {}", e);
-                                return Err(e);
-                            },
-                            Ok(None) => {
-                                trace!("Creating new item");
-                                item.count = 1;
-                                item.places[0] = idx;
-                                item
-                            },
-                            Ok(Some(mut item)) => {
-                                trace!("Found follow-up item");
-                                item.places[item.count] = idx;
-                                item.count += 1;
-                                item
-                            }
+            loop {
+                match tree.get(&item) {
+                    Err(e) => {
+                        error!("Failed to get tree item: {}", e);
+                        return Err(e);
+                    },
+                    Ok(None) => {
+                        trace!("Creating new tree item");
+                        break;
+                    },
+                    Ok(Some(tree_item)) => {
+                        if tree_item.count >= INDEX_PLACES_SIZE {
+                            trace!("Found full item, incrementing");
+                            item.order += 1;
+                        } else {
+                            trace!("Found item with space, merging");
+                            item = tree_item;
+                            break;
                         }
                     }
-                    item
                 }
+            }
+            trace!("Inserting element");
+            item.places[item.count] = IndexPlace {
+                node: counter,
+                offset: 0
             };
-            trace!("Inserting item {:?}", &item);
+            item.count += 1;
+            debug!("Counter {}: {:?}", counter, String::from_utf8_lossy(&line));
+            trace!("Inserting item into tree");
             match tree.insert(item) {
-                Err(e) => {
-                    error!("Error inserting item: {}", e);
-                    return Err(e);
-                },
                 Ok(_) => {
-                    trace!("Successfully inserted item");
+                    trace!("Inserted element successfully");
+                },
+                Err(e) => {
+                    error!("Failed to insert element: {}", e);
+                    return Err(e);
                 }
+            }
+            trace!("Incrementing counter");
+            counter += 1;
+        }
+        trace!("Finished inserting lines");
+
+        debug!("Saving meta info");
+        trace!("Creating meta object");
+        let meta_info = FileMeta {
+            node_count: counter
+        };
+        trace!("Creating json");
+        let data = match json::encode(&meta_info) {
+            Err(e) => {
+                panic!("Failed to encode to json: {}", e)
+            },
+            Ok(d) => {
+                trace!("Data encoded successfully");
+                d
+            }
+        };
+        trace!("Writing to file");
+        match meta.write_all(data.as_ref()) {
+            Err(e) => {
+                error!("Failed to write meta info to file: {}", e);
+                return Err(e);
+            },
+            Ok(()) => {
+                trace!("Meta info written to file successfully");
             }
         }
         Ok(())
@@ -457,59 +713,32 @@ fn main() {
         }
     }
 
-    info!("Init in current directory");
-    match init() {
-        Ok(()) => {
-            trace!("Init successful");
-        },
-        Err(e) => {
-            panic!("Init failed: {}", e);
-        }
-    }
+    trace!("Getting command-line arguments");
+    let args: Vec<String> = env::args().collect();
 
-    trace!("Creating checkout object");
-    let mut checkout = Checkout::default();
-    debug!("Initializing checkout");
-    match checkout.init() {
-        Ok(()) => {
-            trace!("Checkout creation successful");
-        },
-        Err(e) => {
-            panic!("Checkout creation failed: {}", e);
+    if args.len() > 1 && args[1] == "init" {
+        info!("Init in current directory");
+        match init() {
+            Ok(()) => {
+                trace!("Init successful");
+            },
+            Err(e) => {
+                panic!("Init failed: {}", e);
+            }
         }
-    }
-    
-    trace!("Creating Stage object");
-    let mut stage = Stage::default();
-    debug!("Initializing stage");
-    match stage.init() {
-        Ok(()) => {
-            trace!("Stage creation successful");
-        },
-        Err(e) => {
-            panic!("Stage creation failed: {}", e);
-        }
-    }
+    } else {
+        let checkout = Checkout::default();
+        //let stage = Stage::default();
+        let logs = Logs::default();
 
-    trace!("Creating Logs object");
-    let mut logs = Logs::default();
-    debug!("Initializing logs");
-    match logs.init() {
-        Ok(()) => {
-            trace!("Logs creation successful");
-        },
-        Err(e) => {
-            panic!("Logs creation failed: {}", e);
-        }
-    }
-    
-    info!("Walking current directory");
-    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2", ".git", "target", "perf.data"]) {
-        Ok(()) => {
-            debug!("Walk successful");
-        },
-        Err(e) => {
-            panic!("Walk failed: {}", e);
+        info!("Walking current directory");
+        match diff_dir_all(&checkout, &logs, PathBuf::from("."), vec![".h2", ".git", "target", "perf.data", "src"]) {
+            Ok(()) => {
+                debug!("Walk successful");
+            },
+            Err(e) => {
+                panic!("Walk failed: {}", e);
+            }
         }
     }
 }
@@ -528,11 +757,61 @@ fn init() -> Result<(), io::Error> {
         }
     }
 
+    trace!("Creating checkout object");
+    let mut checkout = Checkout::default();
+    debug!("Initializing checkout");
+    match checkout.init() {
+        Ok(()) => {
+            trace!("Checkout creation successful");
+        },
+        Err(e) => {
+            error!("Checkout creation failed: {}", e);
+            return Err(e);
+        }
+    }
+    
+    trace!("Creating Stage object");
+    let mut stage = Stage::default();
+    debug!("Initializing stage");
+    match stage.init() {
+        Ok(()) => {
+            trace!("Stage creation successful");
+        },
+        Err(e) => {
+            error!("Stage creation failed: {}", e);
+            return Err(e);
+        }
+    }
+
+    trace!("Creating Logs object");
+    let mut logs = Logs::default();
+    debug!("Initializing logs");
+    match logs.init() {
+        Ok(()) => {
+            trace!("Logs creation successful");
+        },
+        Err(e) => {
+            error!("Logs creation failed: {}", e);
+            return Err(e);
+        }
+    }
+    
+    info!("Walking current directory");
+    match stage_dir_all(&checkout, &mut logs, &mut stage, PathBuf::from("."), vec![".h2", ".git", "target", "perf.data", "src"]) {
+        Ok(()) => {
+            debug!("Walk successful");
+        },
+        Err(e) => {
+            error!("Walk failed: {}", e);
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
 
 fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(checkout: &Checkout, logs: &mut Logs, stage: &mut Stage, path: T, ignore: V)
-                                                        -> Result<(), io::Error> where V::Item: Into<PathBuf> {
+                                                    -> Result<(), io::Error> where V::Item: Into<PathBuf> {
     let mut to_visit = vec![checkout.path.join(path.into())];
     let to_ignore: HashSet<PathBuf> = HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}));
 
@@ -574,6 +853,7 @@ fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(checkout: &Checkout, logs: &
             };
 
             trace!("Entry path: {:?}", entry.path());
+            trace!("Entry id: {:?}", &id);
             if to_ignore.contains(&id) {
                 // ignore our own directory
                 trace!("Path was in ignore set");
@@ -615,6 +895,95 @@ fn stage_dir_all<T: Into<PathBuf>, V: IntoIterator>(checkout: &Checkout, logs: &
 
             debug!("Creating file index");
             match logs.add_path(&info) {
+                Ok(()) => {
+                    trace!("Index creation successful");
+                },
+                Err(e) => {
+                    error!("Index creation failed: {}", e);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    trace!("Init finished");
+    Ok(())
+}
+
+fn diff_dir_all<T: Into<PathBuf>, V: IntoIterator>(checkout: &Checkout, logs: &Logs, path: T, ignore: V)
+                                                   -> Result<(), io::Error> where V::Item: Into<PathBuf> {
+    let mut to_visit = vec![checkout.path.join(path.into())];
+    let to_ignore: HashSet<PathBuf> = HashSet::from_iter(ignore.into_iter().map(|x| {x.into()}));
+
+    info!("Diffing directory tree");
+    while !to_visit.is_empty() {
+        trace!("Popping directory from queue");
+        let dir = to_visit.pop().unwrap();
+        debug!("Reading directory {:?}", dir);
+        for item in match fs::read_dir(dir) {
+            Ok(iter) => {
+                trace!("Got directory iterator");
+                iter
+            },
+            Err(e) => {
+                error!("Failed to read directory: {}", e);
+                return Err(e);
+            }
+        } {
+            let entry = match item {
+                Ok(item) => {
+                    trace!("No new error");
+                    item
+                },
+                Err(e) => {
+                    error!("Error reading directory: {}", e);
+                    return Err(e);
+                }
+            };
+
+            trace!("Getting path relative to checkout directory");
+            let id = match entry.path().relative_from(&checkout.path) {
+                Some(id) => {
+                    trace!("Got path relative_from successfully");
+                    PathBuf::from(id)
+                },
+                None => {
+                    panic!("Failed to get path relative to checkout path");
+                }
+            };
+
+            trace!("Entry path: {:?}", entry.path());
+            trace!("Entry id: {:?}", &id);
+            if to_ignore.contains(&id) {
+                // ignore our own directory
+                trace!("Path was in ignore set");
+                continue;
+            }
+
+            trace!("Getting file metadata");
+            let metadata = match entry.metadata() {
+                Ok(data) => {
+                    trace!("Got metadata");
+                    data
+                },
+                Err(e) => {
+                    error!("Could not get file metadata: {}", e);
+                    return Err(e);
+                }
+            };
+
+            if metadata.is_dir() {
+                trace!("Adding path to visit queue");
+                to_visit.push(entry.path());
+            } else {
+                trace!("Not adding path to visit queue");
+            }
+            
+            trace!("Creating path info object");
+            let info = PathInfo::new(entry.path(), id, metadata);
+
+            debug!("Creating file index");
+            match logs.diff_path(&info) {
                 Ok(()) => {
                     trace!("Index creation successful");
                 },

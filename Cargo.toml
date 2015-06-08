@@ -6,3 +6,4 @@ authors = ["Jerome Rasky <jyrome.112@gmail.com>"]
 [dependencies]
 log = "*"
 env_logger = "*"
+rustc-serialize = "*"

@@ -305,13 +305,15 @@ impl<T: io::Read + io::Write + io::Seek + fmt::Debug, V: BufItem> BufTree<T, V> 
         // read the root node
         trace!("reading node");
         let mut current = try!(unsafe {self.read_node(root_idx)});
-        trace!("read node");
+        trace!("read node: {:?}", &current);
         // ensure there's at least one item in the root node
         if current.items.is_empty() {
             return Ok(None);
         }
 
         let item = as_item.borrow();
+
+        trace!("Searching with item: {:?}", item);
 
         // loop until we get to a leaf
         loop {
