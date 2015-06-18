@@ -3,6 +3,14 @@ name = "half2"
 version = "0.1.0"
 authors = ["Jerome Rasky <jyrome.112@gmail.com>"]
 
+[[bin]]
+name = "half2"
+path = "src/main.rs"
+
+[[bin]]
+name = "perftest"
+path = "src/perftest.rs"
+
 [dependencies]
 log = "*"
 env_logger = "*"
